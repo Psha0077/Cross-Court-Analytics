@@ -1,0 +1,225 @@
+# 3. Do Left-handed players hit certain shots from specific locations in the court? 
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# ==========================================
+# 0) Load dataset
+# ==========================================
+
+COMBINED_CSV_PATH = Path(
+    "/Users/pranav/Desktop/Dataprojects/Squash/Cross Court Analytics/Raw_data/csv_files/all_matches_combined.csv"
+)
+
+shots = pd.read_csv(COMBINED_CSV_PATH)
+print(f"Loaded {len(shots):,} rows from {COMBINED_CSV_PATH}")
+print("Columns:", list(shots.columns), "\n")
+
+# ==========================================
+# 1) Get list of all distinct player names
+# ==========================================
+
+# Extract names from playerA and playerB columns
+players_A = shots["playerA"].dropna().astype(str).unique()
+players_B = shots["playerB"].dropna().astype(str).unique()
+
+# Combine and dedupe
+all_players = sorted(set(players_A) | set(players_B))
+
+print("\n=== Unique Players in Dataset ===\n")
+for name in all_players:
+    print(name)
+
+print(f"\nTotal unique players: {len(all_players)}")
+
+lefties = [
+    "Amanda Sobhy",
+    "Amanda Sohby",   # duplicate spelling, keep both to catch all rows
+    "Balázs Farkas",
+    "Nick Wall",
+    "Raphael Kandra"
+]
+# Removing white spaces from player names 
+shots["playerA"] = shots["playerA"].astype(str).str.strip()
+shots["playerB"] = shots["playerB"].astype(str).str.strip()
+
+
+# ==========================================
+# 2) WHO hit each shot (hitter name)?
+# team == 0 → playerA, team == 1 → playerB
+# ==========================================
+
+shots["team"] = pd.to_numeric(shots["team"], errors="coerce")
+
+def get_hitter(row):
+    if row["team"] == 0:
+        return row["playerA"]
+    elif row["team"] == 1:
+        return row["playerB"]
+    else:
+        return np.nan
+
+shots["hitter_name"] = shots.apply(get_hitter, axis=1)
+
+# ==========================================
+# 3) Keep ONLY shots hit by left-handed players
+# ==========================================
+
+left_shots = shots[shots["hitter_name"].isin(lefties)].copy()
+
+print(f"\nTotal shots in dataset        : {len(shots):,}")
+print(f"Shots hit by LEFT-HANDED group: {len(left_shots):,}\n")
+
+print("Preview of left-handed shots:")
+print(
+    left_shots[
+        ["match_id", "game_no", "rally_no", "shot_idx",
+         "hitter_name", "x", "y", "shot_type"]
+    ].head()
+)
+
+# ==========================================
+# 4) Ensure coordinate columns are numeric
+# ==========================================
+
+left_shots["x"] = pd.to_numeric(left_shots["x"], errors="coerce")
+left_shots["y"] = pd.to_numeric(left_shots["y"], errors="coerce")
+
+# Destination coords: where the ball is going to (finalPositionX/Y)
+left_shots["finalPositionX"] = pd.to_numeric(left_shots["finalPositionX"], errors="coerce")
+left_shots["finalPositionY"] = pd.to_numeric(left_shots["finalPositionY"], errors="coerce")
+
+# ==========================================
+# 5) Define quadrants (same convention as before)
+# X = 0 (Left wall), X = 1 (Right wall)
+# Y = 0 (Back wall), Y = 1 (Front wall)
+# ==========================================
+
+def assign_quadrant(x, y, mid=0.5):
+    if np.isnan(x) or np.isnan(y):
+        return np.nan
+    if x < mid and y < mid:
+        return "back_left"
+    elif x >= mid and y < mid:
+        return "back_right"
+    elif x < mid and y >= mid:
+        return "front_left"
+    else:
+        return "front_right"
+
+# FROM quadrant = where the shot was hit from (impact location)
+left_shots["from_quadrant"] = [
+    assign_quadrant(xx, yy) for xx, yy in zip(left_shots["x"], left_shots["y"])
+]
+
+# TO quadrant = where the ball is going to (second bounce / error target)
+left_shots["to_quadrant"] = [
+    assign_quadrant(xx, yy) for xx, yy in zip(left_shots["finalPositionX"], left_shots["finalPositionY"])
+]
+
+# Drop any rows where we don't have both quadrants
+left_q = left_shots.dropna(subset=["from_quadrant", "to_quadrant"]).copy()
+print(f"\nLeft-handed shots with valid from/to quadrants: {len(left_q):,}\n")
+
+# ==========================================
+# 6) Clean shot_type → shot_type_clean
+# ==========================================
+
+left_q["shot_type_clean"] = (
+    left_q["shot_type"]
+    .astype(str)
+    .str.strip()
+    .str.lower()
+    .replace({"nan": np.nan, "none": np.nan})
+)
+
+left_q = left_q.dropna(subset=["shot_type_clean"])
+
+print("Top shot types for left-handers:")
+print(left_q["shot_type_clean"].value_counts().head(10), "\n")
+
+# ==========================================
+# 7) Shot Type × FROM Quadrant × TO Quadrant (counts)
+# ==========================================
+
+order_quads = ["back_left", "back_right", "front_left", "front_right"]
+
+left_origin_dest_ct = (
+    left_q
+    .groupby(["shot_type_clean", "from_quadrant", "to_quadrant"])
+    .size()
+    .unstack("to_quadrant", fill_value=0)
+    .reindex(columns=order_quads, fill_value=0)
+)
+
+print("===== LEFTIES ONLY — Shot Type × FROM Quadrant × TO Quadrant (counts) =====\n")
+print(left_origin_dest_ct.to_string(), "\n")
+
+print("===== LEFTIES ONLY — Shot Type × FROM Quadrant × TO Quadrant (counts) =====\n")
+print(left_origin_dest_ct.to_string(), "\n")
+
+
+from scipy.stats import chi2_contingency
+import numpy as np
+
+order = ["back_left", "back_right", "front_left", "front_right"]
+
+print("\n================ LEFT-HANDERS — SIGNIFICANCE BY SHOT TYPE ================\n")
+
+# Loop over each shot type for LEFT-HANDED players
+for shot in left_q["shot_type_clean"].unique():
+
+    print(f"\n===== Shot Type (LEFTIES): {shot.upper()} =====\n")
+
+    # 1. Subset only this shot type
+    subset = left_q[left_q["shot_type_clean"] == shot]
+
+    # 2. Build FROM × TO contingency table (4×4, ordered)
+    ct = pd.crosstab(
+        subset["from_quadrant"],
+        subset["to_quadrant"]
+    ).reindex(index=order, columns=order, fill_value=0)
+
+    # If there are no counts at all (edge case), skip
+    if ct.to_numpy().sum() == 0:
+        print("No data for this shot type among left-handers.\n")
+        continue
+
+    # 3. Chi-square test of independence
+    chi2, p, dof, expected = chi2_contingency(ct)
+
+    print(f"Chi-square statistic : {chi2:,.2f}")
+    print(f"Degrees of freedom   : {dof}")
+    print(f"P-value              : {p:.6f}\n")
+
+    # 4. Expected frequencies dataframe (for clarity)
+    expected_df = pd.DataFrame(expected, index=order, columns=order)
+
+    # 5. Standardized residuals: (observed - expected) / sqrt(expected)
+    residuals = (ct - expected_df) / np.sqrt(expected_df)
+
+    # 6. Flatten results for readable listing
+    flat = residuals.stack().reset_index()
+    flat.columns = ["from_quadrant", "to_quadrant", "std_residual"]
+    flat["abs_resid"] = flat["std_residual"].abs()
+    flat["direction"] = np.where(
+        flat["std_residual"] > 0,
+        "overrepresented",
+        "underrepresented"
+    )
+
+    # 7. Sort by |residual| (most significant transitions first)
+    flat_sorted = flat.sort_values("abs_resid", ascending=False)
+
+    # 8. Print ALL transitions for this shot type (left-handers)
+    for _, row in flat_sorted.iterrows():
+        from_q = row["from_quadrant"]
+        to_q   = row["to_quadrant"]
+        z      = row["std_residual"]
+        direc  = row["direction"]
+
+        print(
+            f"{shot:<7} {from_q:>10} → {to_q:<11} "
+            f"residual={z:+.2f} ({direc})"
+        )
